@@ -20,13 +20,20 @@ from swift.metrics import Metric
 from swift.utils import is_trl_available, is_vllm_ascend_available, is_vllm_available
 from .utils import format_host_for_url, is_valid_ipv6_address, peft_config_to_dict, resolve_hostname
 
+PyNcclCommunicator = None
+StatelessProcessGroup = None
+_VLLM_IMPORT_ERROR = None
 if is_vllm_available():
-    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from vllm.distributed.utils import StatelessProcessGroup
+    try:
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
 
-    if is_vllm_ascend_available():
-        from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator  # noqa
+        if is_vllm_ascend_available():
+            from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator  # noqa
+    except Exception as e:
+        _VLLM_IMPORT_ERROR = e
 
+trl_verison = version.parse('0.0.0')
 if is_trl_available():
     import trl
     trl_verison = version.parse(trl.__version__)
@@ -181,6 +188,10 @@ class VLLMClient:
         return [res for server_results in results for res in server_results]
 
     def init_communicator(self, device: Union[int, str] = 0):
+        if PyNcclCommunicator is None or StatelessProcessGroup is None:
+            raise ImportError(
+                'vLLM communicator components are unavailable. '
+                f'Original import error: {_VLLM_IMPORT_ERROR!r}')
         self.pynccl_comms = []
         for i in range(self.num_servers):
             response = self.sessions[i].get(f'{self.base_urls[i]}/get_world_size/')
@@ -220,6 +231,29 @@ class VLLMClient:
 
         atexit.register(self.close_communicator)
 
+    @staticmethod
+    def _set_cuda_device_for_nccl_op(tensor: torch.Tensor, comm) -> None:
+        if not torch.cuda.is_available():
+            return
+        target_device = tensor.device if isinstance(tensor, torch.Tensor) and tensor.is_cuda else None
+        if target_device is None:
+            target_device = getattr(comm, 'device', None)
+        if target_device is None:
+            return
+        try:
+            torch.cuda.set_device(target_device)
+        except Exception:
+            try:
+                torch.cuda.set_device(torch.device(target_device))
+            except Exception as e:
+                logger.warning('Failed to set CUDA device before NCCL op: %s', e)
+
+    def _broadcast_and_barrier(self, server_idx: int, tensor: torch.Tensor):
+        comm = self.pynccl_comms[server_idx]
+        self._set_cuda_device_for_nccl_op(tensor, comm)
+        comm.broadcast(tensor, src=comm.rank)
+        comm.group.barrier()
+
     def update_named_param(self, name: str, weights: torch.Tensor):
         dtype = str(weights.dtype)
         shape = tuple(weights.shape)
@@ -239,15 +273,12 @@ class VLLMClient:
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update failed: {response.text}')
 
-                self.pynccl_comms[i].broadcast(weights, src=self.pynccl_comms[i].rank)
-                self.pynccl_comms[i].group.barrier()
+                self._broadcast_and_barrier(i, weights)
             except Exception as e:
                 errors[i] = e
 
-        with ThreadPoolExecutor(max_workers=self.num_servers) as executor:
-            futures = [executor.submit(_update_single_server, i) for i in range(self.num_servers)]
-            for future in futures:
-                future.result()
+        for i in range(self.num_servers):
+            _update_single_server(i)
 
         all_errors = [e for e in errors if e is not None]
         if all_errors:
@@ -284,15 +315,12 @@ class VLLMClient:
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update adapter failed: {response.text}')
 
-                self.pynccl_comms[i].broadcast(flattened_tensor, src=self.pynccl_comms[i].rank)
-                self.pynccl_comms[i].group.barrier()
+                self._broadcast_and_barrier(i, flattened_tensor)
             except Exception as e:
                 errors[i] = e
 
-        with ThreadPoolExecutor(max_workers=self.num_servers) as executor:
-            futures = [executor.submit(_update_single_server, i) for i in range(self.num_servers)]
-            for future in futures:
-                future.result()
+        for i in range(self.num_servers):
+            _update_single_server(i)
 
         all_errors = [e for e in errors if e is not None]
         if all_errors:
@@ -343,15 +371,14 @@ class VLLMClient:
 
                 # Broadcast each tensor individually
                 for name, param in lora_params.items():
+                    self._set_cuda_device_for_nccl_op(param, self.pynccl_comms[i])
                     self.pynccl_comms[i].broadcast(param, src=self.pynccl_comms[i].rank)
                 self.pynccl_comms[i].group.barrier()
             except Exception as e:
                 errors[i] = e
 
-        with ThreadPoolExecutor(max_workers=self.num_servers) as executor:
-            futures = [executor.submit(_update_single_server, i) for i in range(self.num_servers)]
-            for future in futures:
-                future.result()
+        for i in range(self.num_servers):
+            _update_single_server(i)
 
         all_errors = [e for e in errors if e is not None]
         if all_errors:
@@ -381,15 +408,12 @@ class VLLMClient:
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update flattened params failed: {response.text}')
 
-                self.pynccl_comms[i].broadcast(flattened_tensor, src=self.pynccl_comms[i].rank)
-                self.pynccl_comms[i].group.barrier()
+                self._broadcast_and_barrier(i, flattened_tensor)
             except Exception as e:
                 errors[i] = e
 
-        with ThreadPoolExecutor(max_workers=self.num_servers) as executor:
-            futures = [executor.submit(_update_single_server, i) for i in range(self.num_servers)]
-            for future in futures:
-                future.result()
+        for i in range(self.num_servers):
+            _update_single_server(i)
 
         all_errors = [e for e in errors if e is not None]
         if all_errors:

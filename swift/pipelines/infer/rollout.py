@@ -13,6 +13,34 @@ try:
         vllm.sampling_params.GuidedDecodingParams = vllm.sampling_params.StructuredOutputsParams
 except ImportError:
     pass
+
+# Compatibility shim: vllm>=0.14 removed get_open_port from vllm.utils,
+# but trl still imports it from there. Inject it before trl is imported.
+try:
+    from vllm.utils import get_open_port  # noqa: F401
+except ImportError:
+    import socket
+    import sys
+
+    def _get_open_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('', 0))
+            return s.getsockname()[1]
+
+    # Try importing from the new location (vllm.v1.utils) first
+    try:
+        from vllm.v1.utils import get_open_port as _v1_get_open_port
+        _get_open_port = _v1_get_open_port
+    except (ImportError, AttributeError):
+        pass
+
+    # Inject into vllm.utils so that `from vllm.utils import get_open_port` works
+    _vllm_utils = sys.modules.get('vllm.utils')
+    if _vllm_utils is not None:
+        _vllm_utils.get_open_port = _get_open_port
+    else:
+        import vllm.utils
+        vllm.utils.get_open_port = _get_open_port
 # fmt: on
 
 import asyncio
