@@ -22,7 +22,7 @@ MAX_NPU_EXPERTS_PER_EP = 128
 
 @dataclass
 class RLHFMegatronArgumentsMixin:
-    rlhf_type: Literal['dpo', 'kto', 'grpo', 'gkd', 'rm'] = None
+    rlhf_type: Literal['dpo', 'kto', 'grpo', 'mapo', 'gkd', 'rm'] = None
     ref_load: Optional[str] = None
     ref_adapter_load: Optional[str] = None
 
@@ -49,10 +49,10 @@ class RLHFMegatronArgumentsMixin:
     offload_teacher_model: bool = False  # Offload teacher model to CPU to save GPU memory
     sft_alpha: float = 0.0  # Weight for SFT loss in GKD (0 = pure JSD, >0 = JSD + sft_alpha * SFT)
 
-    # grpo/gkd
+    # grpo/mapo/gkd
     temperature: float = 0.9  # Temperature for sampling and loss computation
 
-    # grpo
+    # grpo/mapo
     generation_batch_size: Optional[int] = None
     steps_per_generation: Optional[int] = None
     num_generations: int = 8
@@ -144,6 +144,19 @@ class RLHFMegatronArgumentsMixin:
     # Beyond the 80/20 Rule, https://arxiv.org/abs/2506.01939
     top_entropy_quantile: float = 1.0
 
+    # mapo
+    eta: float = 0.001
+    diff_objective: Literal['kl', 'softplus_margin'] = 'softplus_margin'
+    diff_kl_type: Literal['forward', 'reverse', 'symmetric'] = 'forward'
+    diff_margin_gamma: float = 2.0
+    diff_margin_beta: float = 4.0
+    entropy_mask_quantile: float = 0.25
+    entropy_mask_scope: Literal['sequence', 'global', 'group'] = 'sequence'
+    entropy_mask_type: Literal['hard', 'soft'] = 'hard'
+    text_only_modality_scope: Literal['audio', 'all'] = 'audio'
+    text_ref_model: Optional[str] = None
+    text_ref_load: Optional[str] = None
+
     # ───────────────────────────  Not Supported Yet  ───────────────────────────
 
     # reward model
@@ -179,15 +192,15 @@ class RLHFMegatronArgumentsMixin:
     def __post_init__(self):
         if self.rlhf_type is None:
             return
-        default_loss_type = {'kto': 'kto', 'dpo': 'sigmoid', 'grpo': 'grpo'}
-        default_beta = {'gkd': 0.5, 'grpo': 0.04}
+        default_loss_type = {'kto': 'kto', 'dpo': 'sigmoid', 'grpo': 'grpo', 'mapo': 'grpo'}
+        default_beta = {'gkd': 0.5, 'grpo': 0.04, 'mapo': 0.04}
         if self.beta is None:
             self.beta = default_beta.get(self.rlhf_type, 0.1)
         if self.loss_type is None:
             self.loss_type = default_loss_type.get(self.rlhf_type)
         if self.rlhf_type == 'kto':
             self._init_kto()
-        if self.rlhf_type == 'grpo':
+        if self.rlhf_type in ('grpo', 'mapo'):
             assert self.vllm_mode is not None, 'vllm_mode is required for Megatron GRPO'
             self._init_grpo()
             if self.vllm_limit_mm_per_prompt is not None:
@@ -267,6 +280,15 @@ class RLHFMegatronArgumentsMixin:
                                                 )  # noqa
         if self.beta is None:
             self.beta = 0.04  # https://arxiv.org/abs/2402.03300
+        if self.rlhf_type == 'mapo':
+            if self.eta < 0:
+                raise ValueError(f'eta ({self.eta}) must be >= 0.')
+            if self.diff_margin_beta <= 0:
+                raise ValueError(f'diff_margin_beta ({self.diff_margin_beta}) must be > 0.')
+            if self.diff_margin_gamma < 0:
+                raise ValueError(f'diff_margin_gamma ({self.diff_margin_gamma}) must be >= 0.')
+            if self.entropy_mask_type == 'hard' and not (0 < self.entropy_mask_quantile <= 1):
+                raise ValueError(f'entropy_mask_quantile ({self.entropy_mask_quantile}) must be in (0, 1].')
         if self.async_generate:
             logger.info('Using async mode. This is a approximate version which '
                         'will use the old weights to generate responses to accelerate. '

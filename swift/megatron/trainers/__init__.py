@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from .dpo_trainer import MegatronDPOTrainer
     from .gkd_trainer import MegatronGKDTrainer
     from .grpo_trainer import MegatronGRPOTrainer
+    from .mapo_trainer import MegatronMAPOTrainer
     from .kto_trainer import MegatronKTOTrainer
     from .reward_trainer import MegatronRewardTrainer
     from .rollout_mixin import MegatronRolloutMixin
@@ -18,6 +19,7 @@ else:
         'dpo_trainer': ['MegatronDPOTrainer'],
         'gkd_trainer': ['MegatronGKDTrainer'],
         'grpo_trainer': ['MegatronGRPOTrainer'],
+        'mapo_trainer': ['MegatronMAPOTrainer'],
         'kto_trainer': ['MegatronKTOTrainer'],
         'reward_trainer': ['MegatronRewardTrainer'],
         'rollout_mixin': ['MegatronRolloutMixin'],

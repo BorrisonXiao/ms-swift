@@ -21,6 +21,7 @@ class MegatronRLHF(MegatronSft):
             'dpo': 'MegatronDPOTrainer',
             'gkd': 'MegatronGKDTrainer',
             'grpo': 'MegatronGRPOTrainer',
+            'mapo': 'MegatronMAPOTrainer',
             'kto': 'MegatronKTOTrainer',
             'rm': 'MegatronRewardTrainer'
         }
@@ -30,17 +31,17 @@ class MegatronRLHF(MegatronSft):
             raise ValueError(f'The current Megatron-SWIFT does not support rlhf_type: {args.rlhf_type}.')
         trainer_cls = getattr(module, trainer_cls_name)
         kwargs = {}
-        if args.rlhf_type in ('grpo', 'gkd'):
+        if args.rlhf_type in ('grpo', 'mapo', 'gkd'):
             kwargs['vllm_client'] = self._prepare_vllm_client()
         return trainer_cls(args, self.template, **kwargs)
 
     def _prepare_template(self) -> None:
         super()._prepare_template()
-        model_mapping = {'grpo': 'train', 'gkd': 'train', 'kto': 'kto'}
+        model_mapping = {'grpo': 'train', 'mapo': 'train', 'gkd': 'train', 'kto': 'kto'}
         self.template.set_mode(model_mapping.get(self.args.rlhf_type, 'rlhf'))
 
     def _get_data_collator(self):
-        if self.args.rlhf_type in ('grpo', 'gkd'):
+        if self.args.rlhf_type in ('grpo', 'mapo', 'gkd'):
             return identity_data_collator
         return super()._get_data_collator()
 
@@ -53,7 +54,7 @@ class MegatronRLHF(MegatronSft):
 
     def _prepare_vllm_client(self):
         # Only prepare vLLM client for server mode
-        if self.args.rlhf_type not in ('grpo', 'gkd') or self.args.vllm_mode != 'server':
+        if self.args.rlhf_type not in ('grpo', 'mapo', 'gkd') or self.args.vllm_mode != 'server':
             return None
         # GKD may not use vLLM (off-policy mode)
         if not getattr(self.args, 'use_vllm', False):

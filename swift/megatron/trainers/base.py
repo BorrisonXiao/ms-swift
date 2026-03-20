@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import collections
+import json
 import logging
 import math
 import os
@@ -112,7 +113,7 @@ class BaseMegatronTrainer(ABC):
             args = get_args()
             data_parallel_size = mpu.get_data_parallel_world_size()
             step_batch_size = args.micro_batch_size * data_parallel_size
-            num_generations = args.num_generations if args.rlhf_type == 'grpo' else 1
+            num_generations = args.num_generations if args.rlhf_type in ('grpo', 'mapo') else 1
             if args.save_strategy == 'epoch':
                 if hasattr(train_dataset, '__len__'):
                     dataset_sample = len(train_dataset) // step_batch_size * step_batch_size * num_generations
@@ -1138,6 +1139,62 @@ class BaseMegatronTrainer(ABC):
         else:
             raise ValueError(f'Source path is neither a file nor a directory: {src_path}')
 
+    @staticmethod
+    def _ensure_last_rank_checkpoint_artifact(src_path: str, *, iteration: int, args) -> bool:
+        """Ensure checkpoint metadata/artifacts are available on the checkpoint-writing rank.
+
+        Megatron native checkpoint metadata may be written on rank0 (`is_master`) while
+        HF export/copy logic in this trainer runs on `is_last_rank`. In multi-node setups
+        with non-shared paths, last rank can't see rank0's files. We first synchronize the
+        exact file bytes from rank0 to last rank, then fall back to local regeneration for
+        simple text/json metadata if needed.
+
+        Returns True iff the source path exists (or was materialized) and should be copied.
+        """
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            if not is_last_rank() or os.path.exists(src_path):
+                return True
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # All ranks must participate in this collective in the same order.
+            rank = torch.distributed.get_rank()
+            payload = None
+            if rank == 0 and os.path.isfile(src_path):
+                with open(src_path, 'rb') as f:
+                    payload = f.read()
+            obj_list = [payload]
+            torch.distributed.broadcast_object_list(obj_list, src=0)
+            payload = obj_list[0]
+            if is_last_rank() and payload is not None and not os.path.exists(src_path):
+                os.makedirs(os.path.dirname(src_path), exist_ok=True)
+                with open(src_path, 'wb') as f:
+                    f.write(payload)
+
+        if not is_last_rank() or os.path.exists(src_path):
+            return True
+
+        base = os.path.basename(src_path)
+        os.makedirs(os.path.dirname(src_path), exist_ok=True)
+
+        if base == 'args.json':
+            from swift.utils.utils import check_json_format
+            logger.warning(f'{base} not found on last rank at `{src_path}`. Writing a local fallback copy.')
+            with open(src_path, 'w', encoding='utf-8') as f:
+                json.dump(check_json_format(args.__dict__), f, ensure_ascii=False, indent=2)
+            return True
+
+        if base == 'latest_checkpointed_iteration.txt':
+            logger.warning(f'{base} not found on last rank at `{src_path}`. Writing a local fallback copy.')
+            with open(src_path, 'w', encoding='utf-8') as f:
+                f.write(str(iteration))
+            return True
+
+        if base == 'common.pt':
+            raise FileNotFoundError(
+                f'`{base}` not found on last rank and could not be synchronized from rank0: {src_path}')
+
+        raise FileNotFoundError(f'Checkpoint artifact missing on last rank and could not be synchronized: {src_path}')
+
     def save_checkpoint(self, iteration, model, *_args, **kwargs):
         args = get_args()
         output_dir = os.path.join(args.save, f'checkpoint-{iteration}')
@@ -1145,7 +1202,10 @@ class BaseMegatronTrainer(ABC):
         origin_save = args.save
         args.save = output_dir
         args_path = os.path.join(os.path.dirname(output_dir), 'args.json')
-        self.copy_path(args_path, os.path.join(output_dir, 'args.json'))
+        # `args.save_args()` writes on `is_master()` while Megatron checkpoint I/O here is executed on `is_last_rank()`.
+        # In multi-node setups with non-shared/local paths, the checkpoint-writing rank may not see rank0's args.json.
+        if self._ensure_last_rank_checkpoint_artifact(args_path, iteration=iteration, args=args):
+            self.copy_path(args_path, os.path.join(output_dir, 'args.json'))
         save_peft_format = args.tuner_type == 'lora' and not args.merge_lora
         if args.save_safetensors and args.no_save_optim:
             model = []
@@ -1162,12 +1222,14 @@ class BaseMegatronTrainer(ABC):
                 os.makedirs(output_dir, exist_ok=True)
                 for fname in ['latest_checkpointed_iteration.txt', 'args.json']:
                     src_path = os.path.join(origin_output_dir, fname)
-                    self.copy_path(src_path, os.path.join(output_dir, fname))
+                    if self._ensure_last_rank_checkpoint_artifact(src_path, iteration=iteration, args=args):
+                        self.copy_path(src_path, os.path.join(output_dir, fname))
                 # common.pt
                 common_path = os.path.join(origin_output_dir, f'iter_{iteration:07d}', 'common.pt')
                 tgt_common_path = os.path.join(output_dir, f'iter_{iteration:07d}', 'common.pt')
                 os.makedirs(os.path.dirname(tgt_common_path), exist_ok=True)
-                self.copy_path(common_path, tgt_common_path)
+                if self._ensure_last_rank_checkpoint_artifact(common_path, iteration=iteration, args=args):
+                    self.copy_path(common_path, tgt_common_path)
             self.bridge.save_weights(
                 self.unwrapped_models,
                 output_dir,

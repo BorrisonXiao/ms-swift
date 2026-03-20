@@ -7,7 +7,7 @@ from .sft_args import MegatronSftArguments
 
 @dataclass
 class MegatronRLHFArguments(MegatronSftArguments):
-    rlhf_type: Literal['dpo', 'kto', 'grpo', 'gkd', 'rm'] = 'dpo'
+    rlhf_type: Literal['dpo', 'kto', 'grpo', 'mapo', 'gkd', 'rm'] = 'dpo'
     loss_scale: str = 'last_round'
     truncation_strategy: Optional[Literal['delete', 'left', 'right', 'split', None]] = None
 
@@ -23,7 +23,7 @@ class MegatronRLHFArguments(MegatronSftArguments):
     def _init_truncation_strategy(self):
         if self.truncation_strategy is not None:
             return
-        if self.rlhf_type == 'grpo':
+        if self.rlhf_type in ('grpo', 'mapo'):
             self.truncation_strategy = 'left'
         else:
             self.truncation_strategy = 'delete'
