@@ -146,6 +146,20 @@ class RLHFMegatronArgumentsMixin:
 
     # mapo
     eta: float = 0.001
+    mapo_advantage_floor_eps: float = 0.05
+    mapo_task_fail_gate_floor: float = 0.0
+    mapo_mask_temperature: float = 1.0
+    mapo_temporal_kappa: float = 1.0
+    mapo_attention_layers: str = '47'
+    mapo_attention_head_reduce: Literal['mean', 'max'] = 'max'
+    mapo_attention_layer_reduce: Literal['mean', 'max'] = 'mean'
+    mapo_failure_reward_name: str = 'external_mcqa_accuracy'
+    mapo_failure_threshold: float = 0.0
+    mapo_pos_tags: str = 'NOUN,VERB,ADJ'
+    mapo_attention_only: bool = False
+    mapo_debug_attn_grad_probe: bool = False
+    mapo_debug_attn_grad_probe_interval: int = 0
+    # Deprecated in MAPO phase-2 replacement. Kept for parser compatibility.
     diff_objective: Literal['kl', 'softplus_margin'] = 'softplus_margin'
     diff_kl_type: Literal['forward', 'reverse', 'symmetric'] = 'forward'
     diff_margin_gamma: float = 2.0
@@ -283,12 +297,29 @@ class RLHFMegatronArgumentsMixin:
         if self.rlhf_type == 'mapo':
             if self.eta < 0:
                 raise ValueError(f'eta ({self.eta}) must be >= 0.')
-            if self.diff_margin_beta <= 0:
-                raise ValueError(f'diff_margin_beta ({self.diff_margin_beta}) must be > 0.')
-            if self.diff_margin_gamma < 0:
-                raise ValueError(f'diff_margin_gamma ({self.diff_margin_gamma}) must be >= 0.')
-            if self.entropy_mask_type == 'hard' and not (0 < self.entropy_mask_quantile <= 1):
-                raise ValueError(f'entropy_mask_quantile ({self.entropy_mask_quantile}) must be in (0, 1].')
+            if self.mapo_advantage_floor_eps < 0:
+                raise ValueError(f'mapo_advantage_floor_eps ({self.mapo_advantage_floor_eps}) must be >= 0.')
+            if not (0.0 <= self.mapo_task_fail_gate_floor <= 1.0):
+                raise ValueError(f'mapo_task_fail_gate_floor ({self.mapo_task_fail_gate_floor}) must be in [0, 1].')
+            if self.mapo_mask_temperature <= 0:
+                raise ValueError(f'mapo_mask_temperature ({self.mapo_mask_temperature}) must be > 0.')
+            if self.mapo_temporal_kappa < 1.0:
+                raise ValueError(f'mapo_temporal_kappa ({self.mapo_temporal_kappa}) must be >= 1.')
+            from swift.megatron.trainers.mapo_attention_collector import parse_attention_layer_spec
+            _parsed = parse_attention_layer_spec(self.mapo_attention_layers)
+            if _parsed is not None and len(_parsed) == 0:
+                raise ValueError(
+                    f'mapo_attention_layers ({self.mapo_attention_layers}) must specify at least one layer.')
+            if self.mapo_attention_head_reduce not in ('mean', 'max'):
+                raise ValueError(
+                    f'mapo_attention_head_reduce ({self.mapo_attention_head_reduce}) must be "mean" or "max".')
+            if self.mapo_attention_layer_reduce not in ('mean', 'max'):
+                raise ValueError(
+                    f'mapo_attention_layer_reduce ({self.mapo_attention_layer_reduce}) must be "mean" or "max".')
+            if not str(self.mapo_failure_reward_name or '').strip():
+                raise ValueError('mapo_failure_reward_name must be non-empty.')
+            if not str(self.mapo_pos_tags or '').strip():
+                raise ValueError('mapo_pos_tags must be non-empty.')
         if self.async_generate:
             logger.info('Using async mode. This is a approximate version which '
                         'will use the old weights to generate responses to accelerate. '

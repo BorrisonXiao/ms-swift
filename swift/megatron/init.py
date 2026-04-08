@@ -138,7 +138,10 @@ def _patch_mla_attention():
         if thd_qkv_format and query.shape[-1] != v_dim:
             value = F.pad(value, [0, query.shape[-1] - v_dim])
             self.core_attention.hidden_size_per_attention_head_v = value.shape[-1]
-        if self.checkpoint_core_attention and self.training:
+        # MAPO can selectively disable core-attention recompute on targeted
+        # layers so the cached attention tensor stays on the live autograd path.
+        mapo_force_eager = bool(getattr(self, '_mapo_force_eager', False))
+        if self.checkpoint_core_attention and self.training and not mapo_force_eager:
             core_attn_out = self._checkpointed_attention_forward(
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params)
         else:

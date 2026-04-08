@@ -320,7 +320,8 @@ class Qwen3NextSelfAttention(SelfAttention):
         # ==================================
 
         nvtx_range_push(suffix='core_attention')
-        if self.checkpoint_core_attention and self.training:
+        mapo_force_eager = bool(getattr(self, '_mapo_force_eager', False))
+        if self.checkpoint_core_attention and self.training and not mapo_force_eager:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,

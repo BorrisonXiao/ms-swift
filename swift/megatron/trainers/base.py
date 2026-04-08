@@ -804,15 +804,17 @@ class BaseMegatronTrainer(ABC):
                     string += '{} PPL: {:.6E} | '.format(key, ppl)
                 if writer:
                     writer.add_scalar('{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration)
-                    writer.add_scalar(
-                        '{} validation{} vs samples'.format(key, suffix),
-                        total_loss_dict[key].item(),
-                        args.consumed_train_samples,
-                    )
+                    if self._should_log_vs_samples(f'{key} validation{suffix}'):
+                        writer.add_scalar(
+                            '{} validation{} vs samples'.format(key, suffix),
+                            total_loss_dict[key].item(),
+                            args.consumed_train_samples,
+                        )
                     if args.log_validation_ppl_to_tensorboard and ppl is not None:
                         writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
-                        writer.add_scalar('{} validation{} ppl vs samples'.format(key, suffix), ppl,
-                                          args.consumed_train_samples)
+                        if self._should_log_vs_samples(f'{key} validation{suffix} ppl'):
+                            writer.add_scalar('{} validation{} ppl vs samples'.format(key, suffix), ppl,
+                                              args.consumed_train_samples)
                     if wandb_writer and is_last_rank():
                         wandb_writer.log({'{} validation{}'.format(key, suffix): total_loss_dict[key].item()},
                                          iteration)
@@ -834,6 +836,9 @@ class BaseMegatronTrainer(ABC):
 
     def _remove_log(self, total_loss_dict):
         pass
+
+    def _should_log_vs_samples(self, key: str) -> bool:
+        return True
 
     def custom_log(self, total_loss_dict, mode: Literal['train', 'eval'], iteration=None) -> None:
         writer = get_tensorboard_writer()
@@ -911,7 +916,8 @@ class BaseMegatronTrainer(ABC):
             if wandb_writer:
                 wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
             writer.add_scalar('learning-rate', learning_rate, iteration)
-            writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
+            if self._should_log_vs_samples('learning-rate'):
+                writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'learning-rate': learning_rate}, iteration)
             if args.decoupled_lr is not None:
@@ -921,39 +927,46 @@ class BaseMegatronTrainer(ABC):
                 if wandb_writer:
                     wandb_writer.log({'skipped-train-samples': args.skipped_train_samples}, iteration)
             writer.add_scalar('batch-size', batch_size, iteration)
-            writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
+            if self._should_log_vs_samples('batch-size'):
+                writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'batch-size': batch_size}, iteration)
             log_loss_dict = loss_dict.copy()
             self._remove_log(log_loss_dict)
             for key in log_loss_dict:
                 writer.add_scalar(key, loss_dict[key], iteration)
-                writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
+                if self._should_log_vs_samples(key):
+                    writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
                 if wandb_writer:
                     wandb_writer.log({key: loss_dict[key]}, iteration)
             if args.log_loss_scale_to_tensorboard:
                 writer.add_scalar('loss-scale', loss_scale, iteration)
-                writer.add_scalar('loss-scale vs samples', loss_scale, args.consumed_train_samples)
+                if self._should_log_vs_samples('loss-scale'):
+                    writer.add_scalar('loss-scale vs samples', loss_scale, args.consumed_train_samples)
                 if wandb_writer:
                     wandb_writer.log({'loss-scale': loss_scale}, iteration)
             if args.log_world_size_to_tensorboard:
                 writer.add_scalar('world-size', args.world_size, iteration)
-                writer.add_scalar('world-size vs samples', args.world_size, args.consumed_train_samples)
+                if self._should_log_vs_samples('world-size'):
+                    writer.add_scalar('world-size vs samples', args.world_size, args.consumed_train_samples)
                 if wandb_writer:
                     wandb_writer.log({'world-size': args.world_size}, iteration)
             if grad_norm is not None:
                 writer.add_scalar('grad-norm', grad_norm, iteration)
-                writer.add_scalar('grad-norm vs samples', grad_norm, args.consumed_train_samples)
+                if self._should_log_vs_samples('grad-norm'):
+                    writer.add_scalar('grad-norm vs samples', grad_norm, args.consumed_train_samples)
                 if wandb_writer:
                     wandb_writer.log({'grad-norm': grad_norm}, iteration)
             if num_zeros_in_grad is not None:
                 writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
-                writer.add_scalar('num-zeros vs samples', num_zeros_in_grad, args.consumed_train_samples)
+                if self._should_log_vs_samples('num-zeros'):
+                    writer.add_scalar('num-zeros vs samples', num_zeros_in_grad, args.consumed_train_samples)
                 if wandb_writer:
                     wandb_writer.log({'num-zeros': num_zeros_in_grad}, iteration)
             if params_norm is not None:
                 writer.add_scalar('params-norm', params_norm, iteration)
-                writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
+                if self._should_log_vs_samples('params-norm'):
+                    writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
                 if wandb_writer:
                     wandb_writer.log({'params-norm': params_norm}, iteration)
             if args.log_memory_to_tensorboard:

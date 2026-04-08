@@ -16,6 +16,19 @@ from typing import Optional, Tuple
 import torch
 from megatron.core import mpu
 
+try:
+    from torch.distributed.nn.functional import all_reduce as _dist_nn_all_reduce
+except Exception:  # pragma: no cover - fallback for older torch builds
+    _dist_nn_all_reduce = None
+
+
+def _all_reduce_autograd_safe(tensor: torch.Tensor, op, group) -> torch.Tensor:
+    """All-reduce with autograd support when available."""
+    if _dist_nn_all_reduce is not None:
+        return _dist_nn_all_reduce(tensor, op=op, group=group)
+    torch.distributed.all_reduce(tensor, op=op, group=group)
+    return tensor
+
 
 def vocab_parallel_log_softmax(logits: torch.Tensor) -> torch.Tensor:
     """Compute log_softmax across vocab-parallel sharded logits.
@@ -40,13 +53,14 @@ def vocab_parallel_log_softmax(logits: torch.Tensor) -> torch.Tensor:
     tp_group = mpu.get_tensor_model_parallel_group()
 
     # Step 1: Find global max for numerical stability
-    logits_max = logits.max(dim=-1, keepdim=True)[0]
+    # Detach max-trick path: it is used only for numerical stability.
+    logits_max = logits.max(dim=-1, keepdim=True)[0].detach()
     torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
 
     # Step 2: Compute exp(logits - max) and sum across all TP ranks
     exp_logits = torch.exp(logits - logits_max)
     sum_exp = exp_logits.sum(dim=-1, keepdim=True)
-    torch.distributed.all_reduce(sum_exp, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    sum_exp = _all_reduce_autograd_safe(sum_exp, op=torch.distributed.ReduceOp.SUM, group=tp_group)
 
     # Step 3: Compute log_softmax
     log_softmax = logits - logits_max - torch.log(sum_exp)
@@ -89,6 +103,8 @@ def vocab_parallel_entropy(log_probs: torch.Tensor, chunk_size: int = 512) -> to
         # entropy = -sum(p * log_p) = -sum(exp(log_p) * log_p)
         probs = torch.exp(log_probs_chunk)
         partial_entropy = -(probs * log_probs_chunk).sum(dim=-1)  # [chunk_size]
+        # Entropy is a weighting/diagnostic signal in current MAPO design, not a gradient path.
+        partial_entropy = partial_entropy.detach()
 
         # All-reduce to get global entropy if using TP
         if tp_size > 1:
@@ -127,7 +143,7 @@ def vocab_parallel_kl_div(input_log_probs: torch.Tensor, target_log_probs: torch
 
     if mpu.get_tensor_model_parallel_world_size() > 1:
         tp_group = mpu.get_tensor_model_parallel_group()
-        torch.distributed.all_reduce(partial_kl, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+        partial_kl = _all_reduce_autograd_safe(partial_kl, op=torch.distributed.ReduceOp.SUM, group=tp_group)
 
     return partial_kl
 
@@ -184,7 +200,7 @@ def vocab_parallel_gather_logps(
         gathered_logps = gathered_logps * in_range_mask.float()
         # All-reduce to sum contributions from all ranks
         # (only one rank has non-zero value for each token)
-        torch.distributed.all_reduce(
+        gathered_logps = _all_reduce_autograd_safe(
             gathered_logps, op=torch.distributed.ReduceOp.SUM, group=mpu.get_tensor_model_parallel_group())
 
     # Apply loss mask (labels == -100 are masked)
@@ -228,6 +244,7 @@ def compute_logps_and_entropy_from_logits(
     # Compute entropy if requested (reuse log_probs to avoid redundant computation)
     per_token_entropy = None
     if compute_entropy:
-        per_token_entropy = vocab_parallel_entropy(log_probs, chunk_size=entropy_chunk_size)
+        with torch.no_grad():
+            per_token_entropy = vocab_parallel_entropy(log_probs.detach(), chunk_size=entropy_chunk_size)
 
     return per_token_logps, per_token_entropy
