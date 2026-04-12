@@ -465,6 +465,9 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
         completion_mask_f = completion_mask.float()
         omega_raw = torch.nan_to_num(delta_h_abs.float().abs(), nan=0.0, posinf=0.0, neginf=0.0).detach()
         tau_t = self._build_length_scaled_temperature(completion_mask, self.mapo_mask_temperature)
+        # Optionally use a separate (sharper) base temperature for the ν̃ branch.
+        _nu_base = self.mapo_nu_temperature if self.mapo_nu_temperature > 0 else self.mapo_mask_temperature
+        tau_t_nu = self._build_length_scaled_temperature(completion_mask, _nu_base) if _nu_base != self.mapo_mask_temperature else tau_t
         if pos_gate is None:
             pos_gate_f = completion_mask_f
         else:
@@ -474,12 +477,61 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
             else:
                 pos_gate_f = pos_gate_f.clamp(min=0.0, max=1.0) * completion_mask_f
         omega_probs = self._masked_temperature_softmax(omega_raw, completion_mask, temperature=tau_t)
-        nu_probs = self._masked_temperature_softmax(-omega_raw, completion_mask, temperature=tau_t, gate_mask=pos_gate_f)
+        nu_probs = self._masked_temperature_softmax(-omega_raw, completion_mask, temperature=tau_t_nu, gate_mask=pos_gate_f)
         token_count = completion_mask_f.sum(-1, keepdim=True).clamp(min=1.0)
         pos_token_count = pos_gate_f.sum(-1, keepdim=True).clamp(min=1.0)
         omega_tilde = omega_probs * token_count
         nu_tilde = nu_probs * pos_token_count
         return omega_tilde, nu_tilde, omega_raw
+
+    def _build_entropy_filter_mask(
+        self,
+        delta_h_abs: torch.Tensor,
+        text_ref_entropy: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep-mask for the entropy filter: 1.0=keep, 0.0=filtered.
+
+        Token t is filtered from the attention loss iff BOTH:
+          - |δh[t]| strictly below the p-th percentile of |δh| in the sequence
+          - H_text_ref[t] strictly below the p-th percentile of H_text_ref in the sequence
+
+        Both percentiles are computed over all completion tokens (not just POS-gated tokens)
+        to avoid double-applying the POS gate. The joint condition is conservative: it only
+        removes near-deterministic, audio-agnostic "template" tokens that satisfy both
+        criteria simultaneously.
+
+        When mapo_entropy_filter_percentile == 0.0 the mask is all-ones (feature off).
+        """
+        p = self.mapo_entropy_filter_percentile
+        if p <= 0.0:
+            return completion_mask.float()
+
+        q = p / 100.0
+        keep_mask = torch.ones_like(completion_mask, dtype=torch.float32)
+
+        for b in range(completion_mask.shape[0]):
+            indices = completion_mask[b].nonzero(as_tuple=True)[0]
+            n = int(indices.numel())
+            if n < 2:
+                # Too short for a meaningful percentile; keep all tokens.
+                continue
+
+            delta_vals = delta_h_abs[b, indices].float()
+            text_h_vals = text_ref_entropy[b, indices].float()
+
+            delta_thresh = torch.quantile(delta_vals, q)
+            text_h_thresh = torch.quantile(text_h_vals, q)
+
+            # Strict < avoids over-filtering tied values at the boundary.
+            low_delta = delta_h_abs[b] < delta_thresh
+            low_text_h = text_ref_entropy[b] < text_h_thresh
+            # Guard against non-completion padding positions (e.g. delta_h_abs==0)
+            # that could spuriously satisfy low_delta when delta_thresh > 0.
+            filter_here = low_delta & low_text_h & completion_mask[b]
+            keep_mask[b][filter_here] = 0.0
+
+        return keep_mask
 
     def _build_temporal_weights(self, completion_mask: torch.Tensor) -> torch.Tensor:
         """Build relative temporal weighting (t/T)^kappa over completion tokens."""
@@ -534,11 +586,13 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
 
         completion_mask = completion_mask.bool()
         completion_mask_f = completion_mask.float()
-        per_token_entropy = data.get('per_token_entropy')
+        # Use frozen reference model entropies only (H(text_ref) - H(π_ref)) so that nu_tilde
+        # is a static target that never shifts as the live policy changes during training.
+        ref_per_token_entropy = data.get('ref_per_token_entropy')
         text_ref_per_token_entropy = data.get('text_ref_per_token_entropy')
-        if isinstance(text_ref_per_token_entropy, torch.Tensor) and isinstance(per_token_entropy, torch.Tensor):
+        if isinstance(text_ref_per_token_entropy, torch.Tensor) and isinstance(ref_per_token_entropy, torch.Tensor):
             delta_h = torch.nan_to_num(
-                (text_ref_per_token_entropy - per_token_entropy).float(), nan=0.0, posinf=0.0, neginf=0.0)
+                (text_ref_per_token_entropy - ref_per_token_entropy).float(), nan=0.0, posinf=0.0, neginf=0.0)
         else:
             delta_h = torch.zeros_like(per_token_logps, dtype=torch.float32)
         delta_h = delta_h * completion_mask_f
@@ -548,6 +602,20 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
             delta_h, completion_mask, pos_gate=pos_gate)
         temporal_weights = self._build_temporal_weights(completion_mask)
         task_failed = self._normalize_mapo_task_failed(data.get('mapo_task_failed'), completion_mask, per_token_logps)
+
+        # Entropy filter: zero nu_tilde for tokens that are jointly low-|δh| AND low-H_text_ref.
+        # This removes near-deterministic, audio-agnostic "template" tokens (e.g., "Okay, let's
+        # start with ...") from both the KL shape penalty (target_dist) and the mass term
+        # (pos_completion_mask) inside _compute_mapo_attention_objective — without touching
+        # omega_tilde or the policy-gradient branch.
+        if isinstance(text_ref_per_token_entropy, torch.Tensor):
+            _text_h = torch.nan_to_num(
+                text_ref_per_token_entropy.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            _text_h = torch.zeros_like(delta_h)
+        entropy_filter_mask = self._build_entropy_filter_mask(
+            delta_h.abs(), _text_h, completion_mask)
+        nu_tilde = nu_tilde * entropy_filter_mask
 
         advantages = data.get('advantages')
         if isinstance(advantages, torch.Tensor):
@@ -563,6 +631,7 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
         data['mapo_cached_pos_gate'] = pos_gate
         data['mapo_cached_task_failed'] = task_failed
         data['mapo_cached_advantages_abs'] = advantages_abs
+        data['mapo_cached_entropy_filter_mask'] = entropy_filter_mask
 
     def _collect_mapo_audio_attention_mass(self, data: Dict[str, Any],
                                            completion_mask: torch.Tensor) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
@@ -648,30 +717,75 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
         data['mapo_attn_diagnostics'] = diagnostics
 
     def _compute_mapo_attention_objective(self, audio_mass: torch.Tensor, completion_mask: torch.Tensor,
-                                          nu_tilde: torch.Tensor, temporal_weights: torch.Tensor,
-                                          pos_gate: torch.Tensor, task_failed: torch.Tensor,
+                                          nu_tilde: torch.Tensor, task_failed: torch.Tensor,
                                           advantages: Optional[torch.Tensor] = None,
                                           advantages_abs: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute per-token MAPO attention objective and reduced attention loss.
+        """Compute MAPO attention loss as KL shape penalty + scalar mass penalty.
+
+        The loss has two orthogonal components:
+          - Shape term: KL(nu_tilde_target || actual_audio_dist) — forces the distribution of
+            audio attention to match the frozen nu_tilde target. Resists attention inflation because
+            uniform mass maximises entropy of actual_audio_dist, diverging from the peaked target.
+          - Mass term: -log(total_audio_mass) — shape-agnostic floor that keeps total audio
+            attention non-trivial. Weighted by `mapo_mass_lambda`.
+
+        Both terms are gated by task failure and scaled by advantage magnitude.
 
         `advantages_abs` should be a non-negative per-sequence scale tensor. Callers can
         pass raw `abs(advantages)` or a transformed variant (for example with a floor)
         as long as it remains non-negative.
         """
         floor = getattr(self, 'mapo_task_fail_gate_floor', 0.0)
-        task_fail_gate = task_failed.float().clamp(min=floor, max=1.0).unsqueeze(-1)
+        mass_lambda = getattr(self, 'mapo_mass_lambda', 0.1)
+        task_fail_gate = task_failed.float().clamp(min=floor, max=1.0)  # [B]
         if advantages_abs is not None:
-            advantage_scale = advantages_abs.float().clamp(min=0.0).unsqueeze(-1)
+            advantage_scale = advantages_abs.float().clamp(min=0.0)  # [B]
         elif advantages is not None:
-            advantage_scale = advantages.float().abs().unsqueeze(-1)
+            advantage_scale = advantages.float().abs()  # [B]
         else:
             raise ValueError('Either advantages or advantages_abs must be provided for MAPO attention objective.')
-        # Log-space attention penalty: stronger gradients when audio attention mass collapses near zero.
-        audio_log_penalty = -torch.log((audio_mass.float() + _MAPO_ATTN_LOG_EPS).clamp(min=_MAPO_ATTN_LOG_EPS))
-        per_token_attn_obj = task_fail_gate * advantage_scale * temporal_weights * nu_tilde * pos_gate * audio_log_penalty
-        # POS-gated normalization: average attention objective over active POS tokens only.
-        attn_loss = self._reduce_token_objective(
-            per_token_attn_obj, completion_mask, self.loss_type, denom_weights=pos_gate)
+
+        completion_mask_f = completion_mask.float()
+
+        # --- Shape term: KL(target || actual) ---
+        # Target: nu_tilde is already POS-gated and sequence-normalised; re-normalise to a
+        # proper probability distribution over completion tokens (detached — no gradient path).
+        target_dist = nu_tilde.detach().float() * completion_mask_f
+        target_dist = target_dist / target_dist.sum(-1, keepdim=True).clamp(min=1e-8)  # [B, T]
+
+        # Actual: normalise audio_mass over completion tokens (gradients flow through this).
+        actual_dist = audio_mass.float() * completion_mask_f
+        actual_dist = actual_dist / actual_dist.sum(-1, keepdim=True).clamp(min=1e-8)  # [B, T]
+
+        # One-sided forward KL: only penalise under-attention (ā_t < ν̄_t).
+        # Positions where attention already meets or exceeds the target contribute
+        # zero loss and zero gradient, preserving natural attention peaks.
+        # Gradient: ∂L/∂ā_t = -ν̄_t / ā_t when ā_t < ν̄_t, else 0.
+        log_ratio = (
+            torch.log(target_dist.clamp(min=_MAPO_ATTN_LOG_EPS))
+            - torch.log(actual_dist.clamp(min=_MAPO_ATTN_LOG_EPS))
+        ).clamp(min=0.0)  # [B, T]  zero where actual ≥ target
+
+        kl_per_token = target_dist * log_ratio  # [B, T]
+        per_seq_kl = (kl_per_token * completion_mask_f).sum(-1)  # [B]
+
+        # --- Mass term: -log(total_audio_mass over POS-gated completion tokens) ---
+        # Restrict to the same token set as the KL target: positions where nu_tilde > 0
+        # (i.e. POS-gated AND in completion). This prevents the model from satisfying the
+        # mass penalty by inflating audio attention on non-substantive tokens (prepositions,
+        # punctuation, etc.) that carry zero weight in the KL and are irrelevant to the
+        # modality grounding objective.
+        pos_completion_mask = (target_dist > 0).float()  # derived from nu_tilde; no new args
+        total_mass = (audio_mass.float() * pos_completion_mask).sum(-1)  # [B]
+        per_seq_mass = -torch.log(total_mass.clamp(min=_MAPO_ATTN_LOG_EPS))  # [B]
+
+        # --- Combined gated loss ---
+        gate = task_fail_gate * advantage_scale  # [B]
+        per_seq_attn_obj = gate * (per_seq_kl + mass_lambda * per_seq_mass)  # [B]
+        attn_loss = per_seq_attn_obj.mean()
+
+        # Per-token proxy for diagnostics logging (not used in the loss computation).
+        per_token_attn_obj = kl_per_token * gate.unsqueeze(-1)  # [B, T]
         return per_token_attn_obj, attn_loss
 
     def _get_mapo_target_trainable_params(self) -> List[torch.nn.Parameter]:
@@ -856,13 +970,14 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
         }
 
     def _finalize_mapo_attn_probe_for_logging(self, device: torch.device) -> Dict[str, torch.Tensor]:
+        if not getattr(self, 'mapo_debug_attn_grad_probe', False):
+            return {}
         report = self._empty_mapo_attn_probe_report()
-        if getattr(self, 'mapo_debug_attn_grad_probe', False):
-            live_state = getattr(self, '_mapo_attn_probe_live_state', None)
-            if isinstance(live_state, dict):
-                report = self._finalize_mapo_attn_probe_live_state(live_state)
-                self._mapo_attn_probe_live_state = None
-            self._mapo_attn_probe_prev_report = report
+        live_state = getattr(self, '_mapo_attn_probe_live_state', None)
+        if isinstance(live_state, dict):
+            report = self._finalize_mapo_attn_probe_live_state(live_state)
+            self._mapo_attn_probe_live_state = None
+        self._mapo_attn_probe_prev_report = report
         return self._mapo_attn_probe_report_to_tensors(report, device=device)
 
     def _resolve_failure_reward_index(self, reward_width: int) -> int:
@@ -1023,6 +1138,9 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
         self.mapo_debug_attn_grad_probe_interval = int(
             getattr(args, 'mapo_debug_attn_grad_probe_interval', 0) or 0)
         self.text_only_modality_scope = args.text_only_modality_scope
+        self.mapo_entropy_filter_percentile = float(
+            getattr(args, 'mapo_entropy_filter_percentile', 0.0))
+        self.mapo_nu_temperature = float(getattr(args, 'mapo_nu_temperature', 0.2))
         self._mapo_failure_reward_idx = None
 
         # MAPO phase-2 always requires policy entropy for Delta-H weighting.
@@ -1131,10 +1249,12 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
         """Remove MAPO-only cached tensors before policy forward invocation."""
         model_inputs = super()._prepare_model_inputs(inputs)
         for key in [
-                'text_ref_per_token_logps', 'text_ref_per_token_entropy', 'mapo_pos_gate', 'mapo_task_failed',
+                'text_ref_per_token_logps', 'text_ref_per_token_entropy', 'ref_per_token_entropy',
+                'mapo_pos_gate', 'mapo_task_failed',
                 'mapo_pos_fallback', 'mapo_audio_token_mask', 'mapo_audio_mass', 'mapo_attn_diagnostics',
                 'mapo_cached_omega_tilde', 'mapo_cached_nu_tilde', 'mapo_cached_omega_raw', 'mapo_cached_temporal_weights',
-                'mapo_cached_pos_gate', 'mapo_cached_task_failed', 'mapo_cached_advantages_abs'
+                'mapo_cached_pos_gate', 'mapo_cached_task_failed', 'mapo_cached_advantages_abs',
+                'mapo_cached_entropy_filter_mask'
         ]:
             model_inputs.pop(key, None)
         return model_inputs
@@ -1236,22 +1356,55 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
         return per_token_logps, per_token_entropy
 
     def _maybe_compute_logps(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Populate MAPO text-reference log-prob/entropy tensors in the training batch."""
-        batch = super()._maybe_compute_logps(batch)
+        """Populate reference and text-reference log-prob/entropy tensors in the training batch.
 
-        model_inputs = self._prepare_model_inputs(batch)
-        text_only_inputs = self._build_text_only_inputs(model_inputs)
+        Fully overrides the parent to avoid a redundant forward pass: the parent's
+        null_ref_context forward only returns logps (discards entropy). Here we call
+        _compute_per_token_logps_and_entropy() for the frozen GRPO reference model so we
+        get both ref_per_token_logps and ref_per_token_entropy in a single pass, which is
+        needed to build the frozen nu_tilde target for the KL attention loss.
+        """
         seq_lengths = batch['seq_lengths']
         batch_size = batch['num_samples']
         max_seq_len = batch['completion_mask'].shape[1]
+        model_inputs = self._prepare_model_inputs(batch)
 
+        # 1) Frozen GRPO reference model: logps + entropy in one forward pass.
+        #    Conditioned on: beta != 0 (KL reg needs logps) OR attention loss (needs entropy).
+        if self.beta != 0.0 or self._mapo_attention_loss_enabled:
+            with torch.no_grad(), self.null_ref_context() as ref_models:
+                assert len(ref_models) == 1, 'MAPO currently does not support VPP.'
+                ref_model = ref_models[0]
+                ref_per_token_logps, ref_per_token_entropy = self._compute_per_token_logps_and_entropy(
+                    ref_model, deepcopy(model_inputs),
+                    batch_size=batch_size, max_seq_len=max_seq_len, seq_lengths=seq_lengths)
+                batch['ref_per_token_logps'] = ref_per_token_logps
+                batch['ref_per_token_entropy'] = ref_per_token_entropy
+
+        # 2) Old policy logps (no entropy needed — same as parent behaviour).
+        old_per_token_logps_raw = self.model_forward(
+            self.unwrapped_models[0], iter([deepcopy(model_inputs)]), no_grad=True, per_token=True)['logps']
+        if self.template.padding_free:
+            old_per_token_logps, _ = pad_logps_back_to_batch(
+                logps_rmpad=old_per_token_logps_raw,
+                logits_to_keep=max_seq_len,
+                batch_size=batch_size,
+                seq_lengths=seq_lengths)
+        else:
+            old_per_token_logps = old_per_token_logps_raw
+        batch['old_per_token_logps'] = old_per_token_logps
+
+        # 3) Text-only reference: logps + entropy (existing MAPO logic, unchanged).
+        text_only_inputs = self._build_text_only_inputs(model_inputs)
         with torch.no_grad(), self._text_ref_context() as text_ref_models:
             assert len(text_ref_models) == 1, 'MAPO currently does not support VPP.'
             text_ref_model = text_ref_models[0]
             text_ref_per_token_logps, text_ref_per_token_entropy = self._compute_per_token_logps_and_entropy(
-                text_ref_model, text_only_inputs, batch_size=batch_size, max_seq_len=max_seq_len, seq_lengths=seq_lengths)
+                text_ref_model, text_only_inputs,
+                batch_size=batch_size, max_seq_len=max_seq_len, seq_lengths=seq_lengths)
             batch['text_ref_per_token_logps'] = text_ref_per_token_logps
             batch['text_ref_per_token_entropy'] = text_ref_per_token_entropy
+
         return batch
 
     def loss_func(self, output_tensor: torch.Tensor, data: Dict[str, Any]):
@@ -1366,9 +1519,10 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
         advantages_abs = data.get('mapo_cached_advantages_abs')
 
         if not isinstance(omega_tilde, torch.Tensor) or omega_tilde.shape != completion_mask.shape:
-            if text_ref_per_token_entropy is not None and per_token_entropy is not None:
+            ref_per_token_entropy_fb = data.get('ref_per_token_entropy')
+            if text_ref_per_token_entropy is not None and ref_per_token_entropy_fb is not None:
                 delta_h = torch.nan_to_num(
-                    (text_ref_per_token_entropy - per_token_entropy).float(), nan=0.0, posinf=0.0, neginf=0.0)
+                    (text_ref_per_token_entropy - ref_per_token_entropy_fb).float(), nan=0.0, posinf=0.0, neginf=0.0)
             else:
                 delta_h = torch.zeros_like(per_token_logps, dtype=torch.float32)
             delta_h = delta_h * completion_mask_f
@@ -1414,8 +1568,10 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
         adv_floor_lift_mean = torch.zeros((), dtype=torch.float32, device=per_token_logps.device)
         effective_task_gate_mean = torch.zeros((), dtype=torch.float32, device=per_token_logps.device)
         attn_prefactor_mean = torch.zeros((), dtype=torch.float32, device=per_token_logps.device)
-        attn_grad_probe_metrics = self._mapo_attn_probe_report_to_tensors(
-            self._empty_mapo_attn_probe_report(), per_token_logps.device)
+        attn_grad_probe_metrics: Dict[str, torch.Tensor] = {}
+        if self.mapo_debug_attn_grad_probe:
+            attn_grad_probe_metrics = self._mapo_attn_probe_report_to_tensors(
+                self._empty_mapo_attn_probe_report(), per_token_logps.device)
 
         if self._mapo_attention_loss_enabled:
             temporal_weights = torch.nan_to_num(
@@ -1462,15 +1618,14 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
                     audio_mass=audio_mass,
                     completion_mask=completion_mask,
                     nu_tilde=nu_tilde,
-                    temporal_weights=temporal_weights,
-                    pos_gate=pos_gate,
                     task_failed=task_failed,
                     advantages_abs=advantage_scale)
 
             self._register_mapo_attn_grad_hooks(audio_mass=audio_mass)
-            live_probe_state = getattr(self, '_mapo_attn_probe_live_state', None)
-            attn_grad_probe_metrics.update(
-                self._live_mapo_attn_probe_static_metrics(live_probe_state, per_token_logps.device))
+            if self.mapo_debug_attn_grad_probe:
+                live_probe_state = getattr(self, '_mapo_attn_probe_live_state', None)
+                attn_grad_probe_metrics.update(
+                    self._live_mapo_attn_probe_static_metrics(live_probe_state, per_token_logps.device))
             loss = loss + self.eta * attn_loss
         else:
             pos_gate = torch.zeros_like(pos_gate)
@@ -1490,8 +1645,30 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
         # Keep the primary audio-mass diagnostic aligned with the MAPO reduction path:
         # same loss-type aggregation, restricted to the POS-gated token subset.
         audio_log_penalty = -torch.log((audio_mass + _MAPO_ATTN_LOG_EPS).clamp(min=_MAPO_ATTN_LOG_EPS))
+        # KL shape diagnostic: compute KL per-token between frozen nu_tilde target and actual dist.
+        _cmask_f_diag = completion_mask.float()
+        _nu_tilde_diag = nu_tilde.detach().float() if isinstance(nu_tilde, torch.Tensor) else _cmask_f_diag
+        _target_diag = _nu_tilde_diag * _cmask_f_diag
+        _target_diag = _target_diag / _target_diag.sum(-1, keepdim=True).clamp(min=1e-8)
+        _actual_diag = audio_mass.float() * _cmask_f_diag
+        _actual_diag = _actual_diag / _actual_diag.sum(-1, keepdim=True).clamp(min=1e-8)
+        _kl_diag = (_target_diag * (
+            torch.log(_target_diag.clamp(min=_MAPO_ATTN_LOG_EPS))
+            - torch.log(_actual_diag.clamp(min=_MAPO_ATTN_LOG_EPS))
+        ) * _cmask_f_diag).sum(-1)  # [B]
+        attn_kl_mean = _kl_diag.mean()
+        _total_mass_diag = (audio_mass.float() * (_target_diag > 0).float()).sum(-1)  # [B], POS-gated
+        attn_mass_penalty_mean = -torch.log(_total_mass_diag.clamp(min=_MAPO_ATTN_LOG_EPS)).mean()
         failed_token_gate = pos_gate * task_failed.unsqueeze(-1)
         success_token_gate = pos_gate * (1.0 - task_failed.unsqueeze(-1))
+        # Entropy filter coverage: fraction of completion tokens zeroed out by the filter.
+        _efm = data.get('mapo_cached_entropy_filter_mask')
+        if isinstance(_efm, torch.Tensor) and _efm.shape == completion_mask_f.shape:
+            entropy_filter_frac = (
+                completion_mask_f.sum() - (_efm * completion_mask_f).sum()
+            ) / valid_token_denom
+        else:
+            entropy_filter_frac = torch.zeros((), dtype=torch.float32, device=loss.device)
         custom_metrics = {
             'completions/mean_length': total_lengths.float().mean(),
             'completions/max_length': total_lengths.float().max(),
@@ -1506,6 +1683,8 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
             'mapo/mask_weight_min': mask_weight_min,
             'mapo/delta_h_abs_mean': (omega_raw * completion_mask_f).sum() / valid_token_denom,
             'mapo/attn_loss': attn_loss.clone().detach(),
+            'mapo/attn_kl_mean': attn_kl_mean.clone().detach(),
+            'mapo/attn_mass_penalty_mean': attn_mass_penalty_mean.clone().detach(),
             'mapo/audio_mass_mean': self._reduce_token_mean(
                 audio_mass, completion_mask, self.loss_type, gate_weights=pos_gate),
             'mapo/audio_mass_mean_failed_only': self._reduce_token_mean(
@@ -1519,6 +1698,7 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
             'mapo/audio_mass_max': audio_mass.abs().max(),
             'mapo/task_fail_frac': task_failed.mean(),
             'mapo/pos_gate_on_frac': (pos_gate * completion_mask_f).sum() / valid_token_denom,
+            'mapo/entropy_filter_frac': entropy_filter_frac,
             'mapo/attn_only_mode': torch.tensor(
                 1.0 if self.mapo_attention_only else 0.0, dtype=torch.float32, device=loss.device),
         }

@@ -148,7 +148,7 @@ class RLHFMegatronArgumentsMixin:
     eta: float = 0.001
     mapo_advantage_floor_eps: float = 0.05
     mapo_task_fail_gate_floor: float = 0.0
-    mapo_mask_temperature: float = 1.0
+    mapo_mask_temperature: float = 0.1
     mapo_temporal_kappa: float = 1.0
     mapo_attention_layers: str = '47'
     mapo_attention_head_reduce: Literal['mean', 'max'] = 'max'
@@ -159,6 +159,9 @@ class RLHFMegatronArgumentsMixin:
     mapo_attention_only: bool = False
     mapo_debug_attn_grad_probe: bool = False
     mapo_debug_attn_grad_probe_interval: int = 0
+    mapo_mass_lambda: float = 0.1
+    mapo_entropy_filter_percentile: float = 0.0
+    mapo_nu_temperature: float = 0.2
     # Deprecated in MAPO phase-2 replacement. Kept for parser compatibility.
     diff_objective: Literal['kl', 'softplus_margin'] = 'softplus_margin'
     diff_kl_type: Literal['forward', 'reverse', 'symmetric'] = 'forward'
