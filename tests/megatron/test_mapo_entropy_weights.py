@@ -35,15 +35,16 @@ class TestMAPOPhase2Weights(unittest.TestCase):
         if not self.available:
             self.skipTest('MegatronMAPOTrainer unavailable in this environment')
 
-    def _new_trainer(self, mask_temperature=1.0, temporal_kappa=1.0, loss_type='grpo'):
+    def _new_trainer(self, mask_temperature=1.0, temporal_kappa=1.0, loss_type='grpo', mask_clip=6.0):
         trainer = self.trainer_cls.__new__(self.trainer_cls)
         trainer.mapo_mask_temperature = mask_temperature
+        trainer.mapo_mask_clip = mask_clip
         trainer.mapo_temporal_kappa = temporal_kappa
         trainer.loss_type = loss_type
         return trainer
 
     def test_omega_and_nu_normalization(self):
-        trainer = self._new_trainer(mask_temperature=0.7)
+        trainer = self._new_trainer(mask_temperature=0.7, mask_clip=0.0)  # no clipping → invariant holds
         delta_h_abs = torch.tensor([[0.1, 0.2, 0.8, 0.0], [0.4, 0.6, 0.0, 0.0]], dtype=torch.float32)
         completion_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=torch.bool)
 
@@ -135,6 +136,32 @@ class TestMAPOPhase2Weights(unittest.TestCase):
 
         self.assertLess(high_mass_loss.item(), low_mass_loss.item())
 
+    def test_mask_clip_bounds_weights(self):
+        """Clip=2.0 with low temperature should produce weights capped at 2.0."""
+        trainer = self._new_trainer(mask_temperature=0.01, mask_clip=2.0)
+        # Extreme delta_h_abs to force concentration on index 3.
+        delta_h_abs = torch.tensor([[0.0, 0.0, 0.0, 10.0, 0.0]], dtype=torch.float32)
+        completion_mask = torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.bool)
+
+        omega_tilde, nu_tilde, _ = trainer._build_mapo_relevance_weights(delta_h_abs, completion_mask)
+
+        self.assertLessEqual(omega_tilde.max().item(), 2.0 + 1e-5)
+        self.assertLessEqual(nu_tilde.max().item(), 2.0 + 1e-5)
+
+    def test_mask_clip_disabled_when_zero(self):
+        """Clip=0 should not modify weights (sum-to-token_count invariant holds)."""
+        trainer = self._new_trainer(mask_temperature=0.7, mask_clip=0.0)
+        delta_h_abs = torch.tensor([[0.1, 0.2, 0.8, 0.0], [0.4, 0.6, 0.0, 0.0]], dtype=torch.float32)
+        completion_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=torch.bool)
+
+        omega_tilde, nu_tilde, _ = trainer._build_mapo_relevance_weights(delta_h_abs, completion_mask)
+
+        token_count = completion_mask.float().sum(-1)
+        omega_sum = (omega_tilde * completion_mask.float()).sum(-1)
+        nu_sum = (nu_tilde * completion_mask.float()).sum(-1)
+        self.assertTrue(torch.allclose(omega_sum, token_count, atol=1e-6))
+        self.assertTrue(torch.allclose(nu_sum, token_count, atol=1e-6))
+
     def test_reduce_token_mean_applies_pos_gate_with_grpo_normalization(self):
         completion_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=torch.bool)
         token_values = torch.tensor([[0.1, 0.2, 0.3, 0.0], [0.4, 0.8, 0.0, 0.0]], dtype=torch.float32)
@@ -156,6 +183,146 @@ class TestMAPOPhase2Weights(unittest.TestCase):
 
         # BNPO-style reduction uses a global token mean over the gated tokens.
         self.assertAlmostEqual(reduced.item(), 0.4, places=6)
+
+    # ------------------------------------------------------------------
+    # Regression tests for _compute_mapo_attention_objective fix
+    # (v72 regression: sum-reduction + missing pos_gate → length-dependent
+    #  loss that caused training collapse).
+    # ------------------------------------------------------------------
+
+    def _make_simple_trainer(self, loss_type='grpo', task_fail_floor=0.0, prefactor_clip=0.0):
+        """Build a minimal trainer instance with only the attributes required by
+        _compute_mapo_attention_objective and _build_temporal_weights."""
+        trainer = self.trainer_cls.__new__(self.trainer_cls)
+        trainer.loss_type = loss_type
+        trainer.mapo_task_fail_gate_floor = task_fail_floor
+        trainer.mapo_attn_prefactor_clip = prefactor_clip
+        trainer.mapo_mask_temperature = 1.0
+        trainer.mapo_mask_clip = 6.0
+        trainer.mapo_temporal_kappa = 1.0
+        return trainer
+
+    def test_attn_loss_equals_pos_gated_mean_grpo(self):
+        """With pos_gate=all-ones and unit weights, attn_loss must equal the
+        GRPO per-sequence mean of (gate * temporal * nu * -log(audio_mass))."""
+        trainer = self._make_simple_trainer(loss_type='grpo')
+        B, T = 2, 4
+        # Lengths: seq0 has 3 active tokens, seq1 has 2.
+        completion_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=torch.bool)
+        pos_gate = torch.ones(B, T)
+        temporal = trainer._build_temporal_weights(completion_mask)
+        nu_tilde = torch.ones(B, T)
+        audio_mass = torch.tensor([[0.3, 0.5, 0.8, 0.0], [0.2, 0.6, 0.0, 0.0]])
+        task_failed = torch.ones(B)
+        advantages_abs = torch.tensor([1.0, 1.0])
+
+        per_token_obj, attn_loss = trainer._compute_mapo_attention_objective(
+            audio_mass=audio_mass,
+            completion_mask=completion_mask,
+            nu_tilde=nu_tilde,
+            task_failed=task_failed,
+            temporal_weights=temporal,
+            pos_gate=pos_gate,
+            advantages_abs=advantages_abs)
+
+        # Reference: compute expected GRPO mean manually.
+        log_penalty = -torch.log((audio_mass + 1e-6).clamp(min=1e-6))
+        expected_per_token = temporal * nu_tilde * pos_gate * log_penalty
+        mask_f = completion_mask.float()
+        expected_attn_loss = ((expected_per_token * mask_f).sum(-1) /
+                              (mask_f.sum(-1).clamp(min=1.0))).mean()
+
+        self.assertAlmostEqual(attn_loss.item(), expected_attn_loss.item(), places=5)
+
+    def test_attn_loss_length_invariant_under_padding(self):
+        """attn_loss must not change when extra masked-out padding tokens are appended.
+
+        This is the key property that v72's .sum(-1).mean() violated:
+        a longer completion of all-zeros mask tokens must give the same loss.
+        """
+        trainer = self._make_simple_trainer(loss_type='grpo')
+        completion_mask_short = torch.tensor([[1, 1, 1]], dtype=torch.bool)
+        completion_mask_long = torch.tensor([[1, 1, 1, 0, 0, 0]], dtype=torch.bool)
+        pos_gate_short = torch.ones(1, 3)
+        pos_gate_long = torch.ones(1, 6)
+        # Audio mass: same values, padded with zeros (zeros outside mask are irrelevant).
+        audio_mass_short = torch.tensor([[0.4, 0.6, 0.2]])
+        audio_mass_long = torch.tensor([[0.4, 0.6, 0.2, 0.0, 0.0, 0.0]])
+        nu_short = torch.ones(1, 3)
+        nu_long = torch.ones(1, 6)
+        task_failed = torch.ones(1)
+        advantages_abs = torch.tensor([1.0])
+
+        temporal_short = trainer._build_temporal_weights(completion_mask_short)
+        temporal_long = trainer._build_temporal_weights(completion_mask_long)
+
+        _, loss_short = trainer._compute_mapo_attention_objective(
+            audio_mass=audio_mass_short,
+            completion_mask=completion_mask_short,
+            nu_tilde=nu_short,
+            task_failed=task_failed,
+            temporal_weights=temporal_short,
+            pos_gate=pos_gate_short,
+            advantages_abs=advantages_abs)
+
+        _, loss_long = trainer._compute_mapo_attention_objective(
+            audio_mass=audio_mass_long,
+            completion_mask=completion_mask_long,
+            nu_tilde=nu_long,
+            task_failed=task_failed,
+            temporal_weights=temporal_long,
+            pos_gate=pos_gate_long,
+            advantages_abs=advantages_abs)
+
+        self.assertAlmostEqual(loss_short.item(), loss_long.item(), places=5)
+
+    def test_attn_loss_pos_gate_excludes_masked_tokens_from_denom(self):
+        """Tokens with pos_gate=0 must be excluded from both numerator and denominator.
+
+        Concretely: a 3-token completion where the middle token has pos_gate=0
+        must give the same attn_loss as a 2-token completion with both tokens
+        pos-gated on and identical audio_mass / temporal values.
+        """
+        trainer = self._make_simple_trainer(loss_type='grpo')
+        task_failed = torch.ones(1)
+        advantages_abs = torch.tensor([1.0])
+
+        # 3-token completion; middle token masked out by pos_gate.
+        completion_mask_3 = torch.tensor([[1, 1, 1]], dtype=torch.bool)
+        pos_gate_3 = torch.tensor([[1.0, 0.0, 1.0]])
+        audio_mass_3 = torch.tensor([[0.3, 0.9, 0.5]])  # index 1 irrelevant
+        nu_3 = torch.ones(1, 3)
+        temporal_3 = trainer._build_temporal_weights(completion_mask_3)
+
+        # 2-token completion with only the two pos-active positions.
+        # Temporal weights differ because T changes, so we need to craft them manually
+        # to match what the 3-token completion produces for positions 0 and 2.
+        completion_mask_2 = torch.tensor([[1, 1]], dtype=torch.bool)
+        pos_gate_2 = torch.ones(1, 2)
+        audio_mass_2 = torch.tensor([[0.3, 0.5]])
+        nu_2 = torch.ones(1, 2)
+        # Mirror temporal weights: for seq of T=3, pos 0 gives (1/3)^1, pos 2 gives (3/3)^1.
+        temporal_2 = torch.tensor([[1.0 / 3.0, 1.0]])
+
+        _, loss_3 = trainer._compute_mapo_attention_objective(
+            audio_mass=audio_mass_3,
+            completion_mask=completion_mask_3,
+            nu_tilde=nu_3,
+            task_failed=task_failed,
+            temporal_weights=temporal_3,
+            pos_gate=pos_gate_3,
+            advantages_abs=advantages_abs)
+
+        _, loss_2 = trainer._compute_mapo_attention_objective(
+            audio_mass=audio_mass_2,
+            completion_mask=completion_mask_2,
+            nu_tilde=nu_2,
+            task_failed=task_failed,
+            temporal_weights=temporal_2,
+            pos_gate=pos_gate_2,
+            advantages_abs=advantages_abs)
+
+        self.assertAlmostEqual(loss_3.item(), loss_2.item(), places=5)
 
 
 if __name__ == '__main__':
