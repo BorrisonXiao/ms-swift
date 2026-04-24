@@ -1579,8 +1579,6 @@ class MegatronMAPOTrainer(MegatronGRPOTrainer):
             'mapo/audio_mass_max': audio_mass.abs().max(),
             'mapo/task_fail_frac': task_failed.mean(),
             'mapo/pos_gate_on_frac': (pos_gate * completion_mask_f).sum() / valid_token_denom,
-            'mapo/attn_only_mode': torch.tensor(
-                1.0 if self.mapo_attention_only else 0.0, dtype=torch.float32, device=loss.device),
         }
         if attn_grad_probe_metrics:
             custom_metrics.update(attn_grad_probe_metrics)
